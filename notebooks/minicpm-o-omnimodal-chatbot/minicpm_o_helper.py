@@ -1,3 +1,4 @@
+import io
 import torch
 from threading import Thread
 from copy import deepcopy
@@ -55,7 +56,6 @@ class InsertSlice(MatcherPass):
                 self.model_changed = True
                 # Use new operation for additional matching
                 self.register_new_node(slice)
-                print("applied slice for lm head")
 
                 return True
 
@@ -368,7 +368,7 @@ def convert_vision_encoder(model, model_dir):
         def siglip_vis_embed_forward(
             self,
             pixel_values: torch.FloatTensor,
-            patch_attention_mask: torch.BoolTensor,
+            patch_attention_mask: torch.FloatTensor,
             tgt_sizes: Optional[torch.IntTensor] = None,
             position_ids: Optional[torch.FloatTensor] = None,
         ) -> torch.Tensor:
@@ -388,7 +388,8 @@ def convert_vision_encoder(model, model_dir):
                     fill_value=0,
                 )
 
-                for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
+                patch_attention_mask_bool = patch_attention_mask.bool()
+                for batch_idx, p_attn_mask in enumerate(patch_attention_mask_bool):
                     if tgt_sizes is not None:
                         nb_patches_h = tgt_sizes[batch_idx][0]
                         nb_patches_w = tgt_sizes[batch_idx][1]
@@ -442,7 +443,7 @@ def convert_vision_encoder(model, model_dir):
         def siglip_transformer_forward(
             self,
             pixel_values,
-            patch_attention_mask: Optional[torch.BoolTensor] = None,
+            patch_attention_mask: Optional[torch.FloatTensor] = None,
             tgt_sizes: Optional[torch.IntTensor] = None,
             position_ids: Optional[torch.FloatTensor] = None,
             output_attentions: Optional[bool] = None,
@@ -455,7 +456,7 @@ def convert_vision_encoder(model, model_dir):
 
             batch_size = pixel_values.size(0)
             if patch_attention_mask is None:
-                patch_attention_mask = torch.ones(
+                patch_attention_mask_bool = torch.ones(
                     size=(
                         batch_size,
                         pixel_values.size(2) // self.config.patch_size,
@@ -464,13 +465,16 @@ def convert_vision_encoder(model, model_dir):
                     dtype=torch.bool,
                     device=pixel_values.device,
                 )
+                patch_attention_mask = patch_attention_mask_bool.float()
+            else:
+                patch_attention_mask_bool = patch_attention_mask.bool()
 
             hidden_states = self.embeddings(
                 pixel_values=pixel_values, patch_attention_mask=patch_attention_mask, tgt_sizes=tgt_sizes, position_ids=position_ids
             )
 
-            patch_attention_mask = patch_attention_mask.view(batch_size, -1)
-            attention_mask = _prepare_4d_attention_mask(patch_attention_mask, hidden_states.dtype) if not self._use_flash_attention_2 else patch_attention_mask
+            patch_attention_mask_bool = patch_attention_mask_bool.view(batch_size, -1)
+            attention_mask = _prepare_4d_attention_mask(patch_attention_mask_bool, hidden_states.dtype) if not self._use_flash_attention_2 else patch_attention_mask_bool
 
             encoder_outputs = self.encoder(
                 inputs_embeds=hidden_states,
@@ -502,10 +506,11 @@ def convert_vision_encoder(model, model_dir):
         pixel_values = torch.randn([1, 3, 14, 14448])
         patch_attn_mask = torch.zeros((1, 1, 1032), dtype=torch.bool)
         patch_attn_mask[0, 0, : tgt_sizes[0][0] * tgt_sizes[0][1]] = True
+        patch_attn_mask_float = patch_attn_mask.float()
         position_ids = prepare_vis_position_ids(
             pixel_values, patch_attn_mask, tgt_sizes, model.config.vision_config.patch_size, model.config.vision_config.image_size // model.config.patch_size
         )
-        ov_model = ov.convert_model(vpm, example_input={"pixel_values": pixel_values, "position_ids": position_ids, "patch_attention_mask": patch_attn_mask})
+        ov_model = ov.convert_model(vpm, example_input={"pixel_values": pixel_values, "position_ids": position_ids, "patch_attention_mask": patch_attn_mask_float})
         ov.save_model(ov_model, model_dir / image_emb_path)
         del ov_model
         cleanup_torchscript_cache()
@@ -517,7 +522,7 @@ def convert_vision_encoder(model, model_dir):
     if not (model_dir / resampler_path).exists():
         print("⌛ Convert Resamler model")
 
-        def resampler_forward(self, x, pos_embed, key_padding_mask):
+        def resampler_forward(self, x, pos_embed, key_padding_mask_float):
             bs = x.shape[0]
             x = self.kv_proj(x)  # B * L * D
             x = self.ln_kv(x).permute(1, 0, 2)  # L * B * D
@@ -526,7 +531,8 @@ def convert_vision_encoder(model, model_dir):
 
             q_bs = q.unsqueeze(1).repeat(1, bs, 1)
 
-            out = self.attn(q_bs, x + pos_embed, x, key_padding_mask=key_padding_mask)[0]  # Q * B * D  # L * B * D +  L * B * D
+            key_padding_mask_bool = key_padding_mask_float.bool()
+            out = self.attn(q_bs, x + pos_embed, x, key_padding_mask=key_padding_mask_bool)[0]  # Q * B * D  # L * B * D +  L * B * D
             #  out: Q * B * D
             x = out.permute(1, 0, 2)  # B * Q * D
 
@@ -541,14 +547,14 @@ def convert_vision_encoder(model, model_dir):
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
 
         max_patch_len = torch.max(patch_len)
-        key_padding_mask = torch.zeros((1, max_patch_len), dtype=torch.bool)
+        key_padding_mask_float = torch.zeros((1, max_patch_len), dtype=torch.float)
 
         pos_embed = []
         tgt_h, tgt_w = tgt_sizes[0]
         pos_embed = torch.from_numpy(pos_embed_base[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, 1, -1)))  # patches * D
-        key_padding_mask[0, patch_len:] = True
+        key_padding_mask_float[0, patch_len:] = 1.0
 
-        ov_model = ov.convert_model(model.resampler, example_input=[torch.randn(1, 1032, 1152), pos_embed, key_padding_mask])
+        ov_model = ov.convert_model(model.resampler, example_input=[torch.randn(1, 1032, 1152), pos_embed, key_padding_mask_float])
         ov.save_model(ov_model, model_dir / resampler_path)
         del ov_model
         cleanup_torchscript_cache()
@@ -660,14 +666,53 @@ def prepare_vis_position_ids(pixel_values, patch_attention_mask, tgt_sizes, patc
 core = ov.Core()
 
 
+def update_config(config, pair):
+    if pair[0] not in config:
+        config[pair[0]] = pair[1]
+
+def rename_key(config, old_key, new_key):
+    if old_key in config:
+        opt_value = config.pop(old_key)
+        config[new_key] = opt_value
+
+class KVAxesPosition:
+    def __init__(self, batch: int, seq_len: int):
+        self.batch = batch
+        self.seq_len = seq_len
+
+class KVDesc:
+    def __init__(self, max_prompt_len: int, min_response_len: int):
+        self.max_prompt_len = max_prompt_len
+        self.min_response_len = min_response_len
+
+def update_npu_config(config, model, kv_pos, kv_desc):
+    update_config(config, ("NPU_USE_NPUW", "YES"))
+    update_config(config, ("NPUW_LLM", "YES"))
+
+    update_config(config, ("NPUW_LLM_BATCH_DIM", kv_pos.batch))
+    update_config(config, ("NPUW_LLM_SEQ_LEN_DIM", kv_pos.seq_len))
+
+    update_config(config, ("NPUW_LLM_MAX_PROMPT_LEN", kv_desc.max_prompt_len))
+    update_config(config, ("NPUW_LLM_MIN_RESPONSE_LEN", kv_desc.min_response_len))
+
+    # update_config(config, ("NPUW_DUMP_SUBS", "YES"))
+    update_config(config, ("NPU_COMPILER_DYNAMIC_QUANTIZATION", "YES"))
+
+    rename_key(config, "++PREFILL_CONFIG", "++NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "++GENERATE_CONFIG", "++NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "PREFILL_CONFIG", "NPUW_LLM_PREFILL_CONFIG")
+    rename_key(config, "PREFILL_HINT", "NPUW_LLM_PREFILL_HINT")
+    rename_key(config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG")
+    rename_key(config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT")
+
 class OvModelForCausalLMWithEmb(GenerationMixin):
-    def __init__(self, model_dir, device="CPU", ov_config=None, compile=True, slice_lm_head=True) -> None:
+    def __init__(self, model_dir, device="CPU", ov_config=None, compile=True, slice_lm_head=True, llm_max_prompt_len=1024, llm_min_response_len=128) -> None:
         self._supports_cache_class = False
         self.config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         self.config.is_decoder = True
         self.config.is_encoder_decoder = False
         self.generation_config = GenerationConfig.from_model_config(self.config)
-        model_dir = Path(model_dir)
+        self.model_dir = model_dir
         self.model = core.read_model(model_dir / "language_model.xml")
         self.token_emb = core.read_model(model_dir / "embed_tokens.xml")
         if slice_lm_head:
@@ -682,6 +727,10 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         self.input_names = [input_t.get_any_name() for input_t in self.model.inputs]
         self.main_input_name = "input_ids"
         self.llm_times = []
+        self.m_new_token_times = []
+
+        self.max_prompt_len=llm_max_prompt_len
+        self.min_response_len=llm_min_response_len
         if compile:
             self.compile()
 
@@ -693,12 +742,53 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
 
     def compile(self):
         if self.request is None:
-            self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
+            print("LLM compile on device: ", self._device)
+            m_is_npu = self._device == "NPU"
+            if not m_is_npu:
+                self.request = core.compile_model(self.model, self._device, self.ov_config).create_infer_request()
+
+            else:
+                copy_config = self.ov_config
+                if copy_config is None:
+                    copy_config = {}
+                blob_path = self.model_dir.parent / ".npu_blob_cache" / "llm_npuw.blob"
+                weights_bin = self.model_dir / "language_model.bin"
+                update_config(copy_config, ("WEIGHTS_PATH", str(weights_bin)))
+                if blob_path.exists():
+                    try:
+                        with blob_path.open("rb") as fin:
+                            print(f"Import llm NPUW compiled blob!")
+                            start = time.perf_counter()
+                            model = core.import_model(fin.read(), self._device, copy_config)
+                            self.llm_compilation_time = time.perf_counter() - start
+                            print(f"Import llm NPUW blob done!")
+                    except IOError:
+                        raise Exception(f"blob file can't be opened")
+                    self.request = model.create_infer_request()
+                else:
+                    print(f"Start to compile llm model, device:{self._device}")
+                    kv_desc = KVDesc(max_prompt_len=self.max_prompt_len, min_response_len=self.min_response_len)
+                    kv_pos = KVAxesPosition(batch=0, seq_len=2)
+                    update_npu_config(copy_config, self.model, kv_pos, kv_desc)
+                    start = time.perf_counter()
+                    model = core.compile_model(self.model, self._device, copy_config)
+                    self.llm_compilation_time = time.perf_counter() - start
+                    try:
+                        user_stream = io.BytesIO()
+                        model.export_model(user_stream)
+                        with blob_path.open("wb") as fout:
+                            fout.write(user_stream.getbuffer())
+                    except IOError:
+                        raise Exception(f"blob file can't be exported")
+                    print(f"Compile llm done")
+                    self.request = model.create_infer_request()
+
         self._compile_token_emb()
 
     def _compile_token_emb(self):
         if self.token_emb_request is None:
-            self.token_emb_request = core.compile_model(self.token_emb, self._device, self.ov_config)
+            print("Compile token embedding for LLM")
+            self.token_emb_request = core.compile_model(self.token_emb, "CPU", self.ov_config)
 
     def to(self, device: str):
         if isinstance(device, str):
@@ -733,6 +823,7 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
         # past_key_values are not used explicitly, instead they are handled inside the model
         if past_key_values is None:
             self.llm_times = []
+            self.m_new_token_times = []
             # This is the first iteration in a sequence, reset all states
             if self.request is not None:
                 self.request.reset_state()
@@ -748,6 +839,8 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
             if hasattr(self.config, "scale_emb"):
                 inputs_embeds = inputs_embeds * self.config.scale_emb
         inputs["inputs_embeds"] = inputs_embeds
+        shape = inputs["inputs_embeds"].shape
+        # print("inputs_embeds shape:", shape)
 
         # Add the attention_mask inputs when needed
         if "attention_mask" in self.input_names or "position_ids" in self.input_names:
@@ -797,9 +890,12 @@ class OvModelForCausalLMWithEmb(GenerationMixin):
 
         start = time.perf_counter()
         # Run inference
+        # print("LLM start async")
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
+        # print("LLM infer done")
         self.llm_times.append(time.perf_counter() - start)
+        self.m_new_token_times.append(time.perf_counter())
         logits = self.request.get_tensor("logits").data
         logits = torch.from_numpy(logits).to(self.device)
         past_key_values = ((),)
@@ -880,6 +976,8 @@ class OvMiniCPMO:
         self.processor = processor
         self._pos_embeds = torch.from_numpy(get_2d_sincos_pos_embed(self.embed_dim, 70)).float()
         self.max_size = (70, 70)
+        self.vllm_emb_time = 0
+        self.apm_time = 0
         self.vpm_times = []
         self.resampler_times = []
 
@@ -892,26 +990,48 @@ class OvMiniCPMO:
         return self.llm
 
     def resampler(self, x, tgt_sizes):
+        # print(f"[resampler] x shape {x.shape}")
+
         bs = x.shape[0]
+        token_len = x.shape[1]
 
         patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
 
         self._adjust_pos_cache(tgt_sizes)
 
-        max_patch_len = torch.max(patch_len)
-        key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.bool)
+        # max_patch_len = torch.max(patch_len)
+        max_patch_len = token_len
+        key_padding_mask = torch.zeros((bs, max_patch_len), dtype=torch.float)
 
         pos_embed = []
         for i in range(bs):
             tgt_h, tgt_w = tgt_sizes[i]
             pos_embed.append(self._pos_embeds[:tgt_h, :tgt_w, :].reshape((tgt_h * tgt_w, -1)))  # patches * D
-            key_padding_mask[i, patch_len[i] :] = True
+            key_padding_mask[i, patch_len[i] :] = 1.0
 
         pos_embed = torch.nn.utils.rnn.pad_sequence(pos_embed, batch_first=True, padding_value=0.0).permute(1, 0, 2)  # BLD => L * B * D
+        padding_needed = max_patch_len - pos_embed.shape[0]
+        pos_embed = torch.nn.functional.pad(pos_embed, (0, 0, 0, 0, 0, padding_needed), mode='constant', value=0.0)
+
+        # print(f"[resampler] pos_embed shape {pos_embed.shape}")
+        # print(f"[resampler] key_padding_mask shape {key_padding_mask.shape}")
 
         start = time.perf_counter()
-        res = torch.from_numpy(self._resampler([x, pos_embed, key_padding_mask])[0])
+        step = 1
+        output = []
+        for i in range(0, bs, step):
+            start_idx = i
+            end_idx = i + step
+            b_x = x[start_idx:end_idx]
+            b_pos_embed = pos_embed[:, start_idx:end_idx, :]
+            b_key_padding_mask = key_padding_mask[start_idx:end_idx]
+            tmp_resample_output = torch.from_numpy(self._resampler([b_x, b_pos_embed, b_key_padding_mask])[0])
+            output.append(tmp_resample_output)
+        res = torch.cat(output, dim=0)
         self.resampler_times.append(time.perf_counter() - start)
+
+        # print(f"[resampler] Output shape {res.shape}")
+
         return res
 
     def _set_2d_pos_cache(self, max_size):
@@ -975,6 +1095,7 @@ class OvMiniCPMO:
         return input_lengths_after_cnn, input_lengths_after_pooling
 
     def get_vllm_embedding(self, data):
+        emb_start = time.perf_counter()
         if "vision_hidden_states" not in data:
             tgt_sizes = data["tgt_sizes"]
             pixel_values_list = data["pixel_values"]
@@ -994,13 +1115,28 @@ class OvMiniCPMO:
 
                 all_pixel_values = torch.nn.utils.rnn.pad_sequence(all_pixel_values, batch_first=True, padding_value=0.0)
                 B, L, _ = all_pixel_values.shape
+
                 all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+
+                # print(f"[vision encoder] orig all_pixel_values shape {all_pixel_values.shape}")
+                # TODO: Remove the hard coding
+                targetL = 14 * 1036
+                padding_needed = targetL - L
+                all_pixel_values = torch.nn.functional.pad(all_pixel_values, (0, padding_needed, 0, 0), mode='constant', value=0.0)
+                # print(f"[vision encoder] new all_pixel_values shape {all_pixel_values.shape}")
 
                 patch_attn_mask = torch.zeros((B, 1, max_patches), dtype=torch.bool)
                 for i in range(B):
                     patch_attn_mask[i, 0, : tgt_sizes[i][0] * tgt_sizes[i][1]] = True
+                # print(f"[vision encoder] orig patch_attn_mask shape {patch_attn_mask.shape}")
+                targetL = 1036
+                padding_needed = targetL - patch_attn_mask.shape[2]
+                patch_attn_mask = torch.nn.functional.pad(patch_attn_mask, (0, padding_needed, 0, 0), mode='constant', value=False)
+                # print(f"[vision encoder] new patch_attn_mask shape {patch_attn_mask.shape}")
 
-                vision_batch_size = 32
+                # vision_batch_size = 32
+                # For NPU
+                vision_batch_size = 1
                 all_pixel_values = all_pixel_values
                 if B > vision_batch_size:
                     hs = []
@@ -1018,7 +1154,7 @@ class OvMiniCPMO:
                             self.config.vision_config.image_size // self.config.patch_size,
                         )
                         start = time.perf_counter()
-                        tmp_hs = torch.from_numpy(self.vpm([block_pxl_values, block_patch_attn_mask, block_position_ids])[0])
+                        tmp_hs = torch.from_numpy(self.vpm([block_pxl_values, block_patch_attn_mask.float(), block_position_ids])[0])
                         self.vpm_times.append(time.perf_counter() - start)
                         hs.append(tmp_hs)
                     vision_embedding = torch.cat(hs, dim=0)
@@ -1031,9 +1167,11 @@ class OvMiniCPMO:
                         self.config.vision_config.image_size // self.config.patch_size,
                     )
                     start = time.perf_counter()
-                    vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask, position_ids])[0])
+                    vision_embedding = torch.from_numpy(self.vpm([all_pixel_values, patch_attn_mask.float(), position_ids])[0])
                     self.vpm_times.append(time.perf_counter() - start)
+                # print(f"[vision encoder] output vision_embedding shape: {vision_embedding.shape} {tgt_sizes.shape}")
                 vision_embedding = self.resampler(vision_embedding, tgt_sizes)
+                # print("[vision encoder] vision_embedding shape after resampler:", vision_embedding.shape)
 
                 start = 0
                 for pixel_values in pixel_values_list:
@@ -1066,6 +1204,8 @@ class OvMiniCPMO:
                     image_indices = torch.stack([torch.arange(r[0], r[1], dtype=torch.long) for r in cur_image_bound])
 
                     cur_vllm_emb.scatter_(0, image_indices.view(-1, 1).repeat(1, cur_vllm_emb.shape[-1]), cur_vs_hs.view(-1, cur_vs_hs.shape[-1]))
+        emb_end = time.perf_counter()
+        self.vllm_emb_time = emb_end - emb_start
         return vllm_embedding, vision_hidden_states
 
     def get_audio_embedding(self, data, chunk_length=-1, dummy=True):
@@ -1088,9 +1228,16 @@ class OvMiniCPMO:
         """
 
         wavforms = data.get("audio_features", [])  # (bs, 80, frames) or [], multi audios need filled in advance
+
         audio_feature_lens_raw = data.get("audio_feature_lens", [])  # list, [[x1, x2], [y1], [z1]]
         # exist audio
         if len(wavforms) > 0:
+            # print(f"[Audio encoder] wavforms shape {wavforms.shape}")
+            # TODO: Remove the hard coding
+            targetL = 1520
+            padding_needed = targetL - wavforms.shape[2]
+            wavforms = torch.nn.functional.pad(wavforms, (0, padding_needed, 0, 0), mode='constant', value=0.0)
+            # print(f"[Audio encoder] padding wavforms shape {wavforms.shape}")
             audio_feature_lens = torch.hstack(audio_feature_lens_raw)
             batch_size, _, max_mel_seq_len = wavforms.shape
             max_seq_len = (max_mel_seq_len - 1) // 2 + 1
@@ -1117,9 +1264,30 @@ class OvMiniCPMO:
                 audio_attention_mask_ = torch.logical_or(audio_attention_mask_, torch.logical_not(chunk_mask))
 
             audio_attention_mask[audio_attention_mask_] = float("-inf")
-            audio_outputs = self.apm([wavforms, audio_attention_mask])
 
+            apm_start = time.perf_counter()
+            step = 1
+            output = []
+            for i in range(0, batch_size, step):
+                start_idx = i
+                end_idx = i + step
+                b_wavform = wavforms[start_idx:end_idx]
+                b_audio_attention_mask = audio_attention_mask[start_idx:end_idx]
+                # print(f"[Audio encoder] b_wavform shape {b_wavform.shape}, b_audio_attention_mask shape {b_audio_attention_mask.shape}")
+                tmp_audio_output = torch.from_numpy(self.apm([b_wavform, b_audio_attention_mask])[-1])
+                # print(f"[Audio encoder] tmp_audio_output shape {tmp_audio_output.shape}")
+                output.append(tmp_audio_output)
+            audio_outputs = torch.cat(output, dim=0)
+            # print(f"[Audio encoder] audio_outputs shape {audio_outputs.shape}")
+            audio_embeds = audio_outputs
+
+            """
+            audio_outputs = self.apm([wavforms, audio_attention_mask])
             audio_embeds = torch.from_numpy(audio_outputs[-1])
+            """
+            self.apm_time = time.perf_counter() - apm_start
+
+            # print(f"[Audio encoder] audio_embeds shape {audio_embeds.shape}")
 
             _, feature_lens_after_pooling = self._get_feat_extract_output_lengths(audio_feature_lens)
 
@@ -1152,7 +1320,7 @@ class OvMiniCPMO:
             audio_embeddings = self.get_audio_embedding_streaming(data)
         else:
             audio_embeddings = self.get_audio_embedding(data, chunk_length)
-
+        # print(f"audio_embeddings len {len(input_embeddings)}")
         bs = len(input_embeddings)
         if len(data.get("audio_features", [])) > 0:
             assert len(audio_embeddings) == len(input_embeddings)
@@ -1199,6 +1367,7 @@ class OvMiniCPMO:
             if key in kwargs:
                 del kwargs[key]
 
+        # print("vllm embedding shape: ", vllm_embedding.shape)
         return self.llm(input_ids=None, position_ids=position_ids, inputs_embeds=vllm_embedding, **kwargs)
 
     def _decode(self, inputs_embeds, tokenizer, attention_mask, decode_text=False, **kwargs):
@@ -1361,11 +1530,15 @@ class OvMiniCPMO:
         model_output = {}
         with torch.inference_mode():
             model_inputs["inputs_embeds"], vision_hidden_states = self.get_vllm_embedding(model_inputs)
+            shape = model_inputs["inputs_embeds"].shape
+            #print("get_vllm_embedding shape:", shape)
             model_inputs["inputs_embeds"] = self.get_omni_embedding(
                 model_inputs,
                 input_embeddings=model_inputs["inputs_embeds"],
                 chunk_length=self.config.audio_chunk_length,
             )
+            shape = model_inputs["inputs_embeds"].shape
+            #print("get_omni_embedding shape:", shape)
 
             if stream:
                 result = self._decode_stream(model_inputs["inputs_embeds"], tokenizer, **kwargs)
@@ -1428,6 +1601,13 @@ class OvMiniCPMO:
             output_audio_path: audio save path when generate_audio
             **kwargs:
         """
+        self.vllm_emb_time = 0
+        self.apm_time = 0
+        self.vpm_times = []
+        self.resampler_times = []
+        self.llm.llm_times = []
+        self.llm.m_new_token_times = 0
+
         if isinstance(msgs[0], list):
             batched = True
         else:
@@ -1523,6 +1703,7 @@ class OvMiniCPMO:
             input_audios_list.append(audios)
             audio_parts_list.append(audio_parts)
 
+        # print("prompts_lists: ", prompts_lists)
         inputs = processor(
             prompts_lists,
             input_images_list,
@@ -1597,13 +1778,199 @@ class OvMiniCPMO:
 
             return answer
 
+def convert_vpm_to_static_shape(model, patch_size):
+    batch_size = 1
+    patch_len = 1036
 
-def init_model(model_dir, llm_model_dir, device):
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("pixel_values"):
+            input_shape[0] = batch_size
+            input_shape[1] = 3
+            input_shape[2] = patch_size
+            input_shape[3] = patch_size * patch_len
+        elif input_name.startswith("patch_attention_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = 1
+            input_shape[2] = patch_len
+        #elif input_name.startswith("position_ids"):
+        else:
+            input_shape[0] = batch_size
+            input_shape[1] = patch_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
+def convert_apm_to_static_shape(model):
+    batch_size = 1
+    feature_len = 80
+    max_mel_seq_len = 1520
+    max_seq_len = (max_mel_seq_len - 1) // 2 + 1
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+        numDim = len(input_shape)
+
+        if numDim == 3: # "input_features"
+            input_shape[0] = batch_size
+            input_shape[1] = feature_len
+            input_shape[2] = max_mel_seq_len
+        elif numDim == 4: # "attention_mask"
+            input_shape[0] = batch_size
+            input_shape[1] = 1
+            input_shape[2] = max_seq_len
+            input_shape[3] = max_seq_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
+def convert_resampler_to_static_shape(model):
+    """
+    [resampler] x shape torch.Size([10, 1036, 1152])
+    [resampler] pos_embed shape torch.Size([1036, 10, 3584])
+    [resampler] key_padding_mask shape torch.Size([10, 1036])
+    """
+    batch_size = 1
+    token_len = 1036
+    feature_len = 1152
+    hidden_states_len = 3584
+
+    shapes = {}
+
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+        numDim = len(input_shape)
+
+        if input_name.startswith("x"):
+            input_shape[0] = batch_size
+            input_shape[1] = token_len
+            input_shape[2] = feature_len
+        elif input_name.startswith("pos_embed"):
+            input_shape[0] = token_len
+            input_shape[1] = batch_size
+            input_shape[2] = hidden_states_len
+        elif input_name.startswith("key_padding_mask"):
+            input_shape[0] = batch_size
+            input_shape[1] = token_len
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    # Reshape the model
+    model.reshape(shapes)
+
+    return model
+
+def npu_model_import_or_compile(blob_path, model_path, convert_func, device, model_type, config=None):
+    """
+    Import or compile blob for NPU device, either audio or vision encoder.
+
+    Parameters:
+    - blob_path: Path to the compiled blob file.
+    - model_path: Path to the model file.
+    - convert_func: Function to convert the model to a static shape.
+    - device: Device to compile the model on.
+    - model_type: Type of the model ('audio' or 'vision').
+    - config: Optional configuration for vision encoder.
+    """
+
+    assert device == "NPU"
+
+    if blob_path.exists():
+        try:
+            with blob_path.open("rb") as fin:
+                print(f"Import {model_type} compiled blob!")
+                model = core.import_model(fin.read(), device)
+                print(f"Import {model_type} blob done!")
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be opened")
+    else:
+        model = core.read_model(model_path)
+        if model_type == 'vision_encoder' and config:
+            model = convert_func(model, config.vision_config.patch_size)
+            ir_name = model_type + "_static.xml"
+        elif model_type == 'audio':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        elif model_type == 'resampler':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        else:
+            print(f"Unsupported {model_type}")
+            assert(1)
+
+        ov.serialize(model, blob_path.parent / ir_name)
+        print(f"Start to compile {ir_name}, device:{device}")
+        config = {}
+        update_config(config, ("NPU_DPU_GROUPS", "6"))
+        model = core.compile_model(model, device, config)
+        try:
+            user_stream = io.BytesIO()
+            model.export_model(user_stream)
+            with blob_path.open("wb") as fout:
+                fout.write(user_stream.getbuffer())
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be exported")
+        print(f"Compile {model_type} done")
+
+    return model
+
+def init_model(model_dir, llm_model_dir, device, max_prompt_len=1024, min_response_len=128):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
-    img_emb = core.compile_model(model_dir / image_emb_path, device)
-    aud_emb = core.compile_model(model_dir / audio_emb_path, device)
-    resampler = core.compile_model(model_dir / resampler_path, device)
+    m_is_npu = device == "NPU"
+
+    if m_is_npu:
+        # Audio encoder
+        audio_enc_blob_path = model_dir / ".npu_blob_cache" / "whisper_enc.blob"
+        aud_emb = npu_model_import_or_compile(audio_enc_blob_path, model_dir / audio_emb_path, convert_apm_to_static_shape, device, 'audio_encoder')
+
+        # Vision encoder
+        vision_enc_blob_path = model_dir / ".npu_blob_cache" / "vision_enc.blob"
+        img_emb = npu_model_import_or_compile(vision_enc_blob_path, model_dir / image_emb_path, convert_vpm_to_static_shape, device, 'vision_encoder', config)
+
+        # Resampler
+        resampler_blob_path = model_dir / ".npu_blob_cache" / "resampler.blob"
+        resampler = npu_model_import_or_compile(resampler_blob_path, model_dir / resampler_path, convert_resampler_to_static_shape, device, 'resampler')
+
+        # LLM
+        llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device, llm_max_prompt_len=max_prompt_len, llm_min_response_len=min_response_len)
+    else:
+        # Audio encoder
+        aud_emb = core.compile_model(model_dir / audio_emb_path, device)
+
+        # Vision encoder
+        img_emb = core.compile_model(model_dir / image_emb_path, device)
+
+        # Resampler
+        resampler = core.compile_model(model_dir / resampler_path, device)
+
+        # LLM
+        llm = OvModelForCausalLMWithEmb(model_dir / llm_model_dir, device)
+
     processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 
     ov_model = OvMiniCPMO(config, img_emb, resampler, aud_emb, llm, processor)

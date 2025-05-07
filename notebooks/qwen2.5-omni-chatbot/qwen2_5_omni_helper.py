@@ -1,6 +1,7 @@
 from pathlib import Path
 import types
 import gc
+import io
 
 import openvino as ov
 import shutil
@@ -1061,18 +1062,190 @@ def get_rope_index(
         return position_ids, mrope_position_deltas
 
 
+def convert_thinker_audio_to_static_shape(model):
+    shapes = {}
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("padded_feature"):
+            input_shape[0] = 3
+            input_shape[1] = 128
+            input_shape[2] = 200
+        elif input_name == "padded_mask":
+            input_shape[0] = 3
+            input_shape[1] = 1
+            input_shape[2] = 200
+        elif input_name == "padded_mask_after_cnn":
+            input_shape[0] = 3
+            input_shape[1] = 100
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    model.reshape(shapes)
+
+    return model
+
+def convert_thinker_audio_state_to_static_shape(model):
+    shapes = {}
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("each_audio_states"):
+            input_shape[0] = 251
+            input_shape[1] = 1280
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    model.reshape(shapes)
+
+    return model
+
+def convert_thinker_vision_to_static_shape(model):
+    shapes = {}
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("hidden_states"):
+            input_shape[0] = 3456
+            input_shape[1] = 1176
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    model.reshape(shapes)
+
+    return model
+
+def convert_thinker_vision_merger_to_static_shape(model):
+    shapes = {}
+    for input in model.inputs:
+        input_shape = input.partial_shape
+        input_name = input.any_name
+
+        if input_name.startswith("hidden_states"):
+            input_shape[0] = 3456
+            input_shape[1] = 1280
+        elif input_name.startswith("attention_mask"):
+            input_shape[0] = 1
+            input_shape[1] = 3456
+            input_shape[2] = 3456
+        elif input_name.startswith("window_attention_mask"):
+            input_shape[0] = 1
+            input_shape[1] = 3456
+            input_shape[2] = 3456
+        elif input_name.startswith("window_index"):
+            input_shape[0] = 864
+        elif input_name.startswith("rotary_pos_emb"):
+            input_shape[0] = 3456
+            input_shape[1] = 40
+
+        shapes[input] = input_shape
+
+        print(f"input_name: {input_name}")
+        print(f"input_shape: {shapes[input]}")
+
+    model.reshape(shapes)
+
+    return model
+
+def update_config(config, pair):
+    if pair[0] not in config:
+        config[pair[0]] = pair[1]
+
+def npu_model_import_or_compile(blob_path, model_path, convert_func, device, model_type, config=None):
+    """
+    Import or compile blob for NPU device, either audio or vision encoder.
+
+    Parameters:
+    - blob_path: Path to the compiled blob file.
+    - model_path: Path to the model file.
+    - convert_func: Function to convert the model to a static shape.
+    - device: Device to compile the model on.
+    - model_type: Type of the model ('audio' or 'vision').
+    """
+
+    # assert device == "NPU"
+
+    if blob_path.exists():
+        try:
+            with blob_path.open("rb") as fin:
+                print(f"Import {model_type} compiled blob!")
+                model = core.import_model(fin.read(), device)
+                print(f"Import {model_type} blob done!")
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be opened")
+    else:
+        model = core.read_model(model_path)
+        if model_type == 'thinker_audio':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        elif model_type == 'thinker_audio_state':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        elif model_type == 'thinker_vision':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        elif model_type == 'thinker_vision_merger':
+            model = convert_func(model)
+            ir_name = model_type + "_static.xml"
+        else:
+            print(f"Unsupported {model_type}")
+            assert(1)
+
+        ov.serialize(model, blob_path.parent / ir_name)
+        print(f"Start to compile {ir_name}, device: NPU")
+        config = {}
+        update_config(config, ("NPU_DPU_GROUPS", "6"))
+        model = core.compile_model(model, 'NPU', config)
+        try:
+            user_stream = io.BytesIO()
+            model.export_model(user_stream)
+            with blob_path.open("wb") as fout:
+                fout.write(user_stream.getbuffer())
+        except IOError:
+            raise Exception(f"{model_type.capitalize()} blob file can't be exported")
+        print(f"Compile {model_type} done")
+
+    return model
+
 class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
     def __init__(self, model_dir, device, config):
-        self.model = core.read_model(model_dir / THINKER_LANGUAGE_NAME)
-        self.audio = core.compile_model(model_dir / THINKER_AUDIO_NAME, device)
-        self.audio_state = core.compile_model(model_dir / THINKER_AUDIO_STATE_NAME, device)
-        self.visual_patcher = core.compile_model(model_dir / THINKER_PATCHER_NAME, device)
-        self.visual_merger = core.compile_model(model_dir / THINKER_MERGER_NAME, device)
+        device_is_npu = device == "NPU"
+        if True or device_is_npu:
+            # Audio Embedding
+            audio_blob_cache_path = model_dir / ".npu_blob_cache" / "thinker_audio.blob"
+            self.audio = npu_model_import_or_compile(audio_blob_cache_path, model_dir / THINKER_AUDIO_NAME, convert_thinker_audio_to_static_shape, device, 'thinker_audio')
+            audio_state_blob_cache_path = model_dir / ".npu_blob_cache" / "thinker_audio_state.blob"
+            self.audio_state = npu_model_import_or_compile(audio_state_blob_cache_path, model_dir / THINKER_AUDIO_STATE_NAME, convert_thinker_audio_state_to_static_shape, device, 'thinker_audio_state')
+            # Vision Embedding
+            vision_blob_cache_path = model_dir / ".npu_blob_cache" / "thinker_vision.blob"
+            self.visual_patcher = npu_model_import_or_compile(vision_blob_cache_path, model_dir / THINKER_PATCHER_NAME, convert_thinker_vision_to_static_shape, device, 'thinker_vision')
+            vision_merger_blob_cache_path = model_dir / ".npu_blob_cache" / "thinker_vision_merger.blob"
+            self.visual_merger = npu_model_import_or_compile(vision_merger_blob_cache_path, model_dir / THINKER_MERGER_NAME, convert_thinker_vision_merger_to_static_shape, device, 'thinker_vision_merger')
+        else:
+            self.audio = core.compile_model(model_dir / THINKER_AUDIO_NAME, device)
+            self.audio_state = core.compile_model(model_dir / THINKER_AUDIO_STATE_NAME, device)
+            self.visual_patcher = core.compile_model(model_dir / THINKER_PATCHER_NAME, device)
+            self.visual_merger = core.compile_model(model_dir / THINKER_MERGER_NAME, device)
+
         self.embed_tokens = core.compile_model(model_dir / THINKER_EMBEDDING_NAME, device)
+        self.model = core.read_model(model_dir / THINKER_LANGUAGE_NAME)
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
         compiled_model = core.compile_model(self.model, device)
         self.request = compiled_model.create_infer_request()
+
         self.main_input_name = "input_ids"
         self.config = config.thinker_config
         self.n_window = self.config.audio_config.n_window

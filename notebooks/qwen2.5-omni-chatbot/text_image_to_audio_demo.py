@@ -67,7 +67,7 @@ conversation = [
             {"type": "text", "text": "What is unusual on this picture?"},
             {"type": "audio", "audio": "Trailer.wav"},
             {"type": "image", "image": "cat.png"},
-            {"type": "video", "video": "coco.mp4"},
+            # {"type": "video", "video": "coco.mp4"},
         ],
     },
 ]
@@ -99,7 +99,7 @@ print(f"audios data: {len(audios)}, type: {type(audios[0])}, shape: {audios[0].s
 # shape: (80001,)
 print(f"images data: {len(images)}, type: {type(images[0])}, shape: {images[0].size if isinstance(images[0], Image.Image) else images[0].shape}")
 # shape: (1008, 672)
-print(f"videos data: {len(videos)}, type: {type(videos[0])}, shape: {videos[0].shape}")
+# print(f"videos data: {len(videos)}, type: {type(videos[0])}, shape: {videos[0].shape}")
 # shape: torch.Size([18, 3, 364, 644])
 
 inputs = processor(text=text, audio=audios, images=images, videos=videos, return_tensors="pt", padding=True, use_audio_in_video=False)

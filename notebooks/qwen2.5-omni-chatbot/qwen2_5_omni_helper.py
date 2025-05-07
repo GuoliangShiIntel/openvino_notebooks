@@ -219,15 +219,62 @@ def cleanup_torchscript_cache():
 
 
 THINKER_LANGUAGE_NAME = "openvino_thinker_language_model.xml"
-THINKER_AUDIO_NAME = "openvino_thinker_audio_model.xml"
-THINKER_AUDIO_STATE_NAME = "openvino_thinker_audio_state_model.xml"
-THINKER_PATCHER_NAME = "openvino_thinker_patcher_model.xml"
-THINKER_MERGER_NAME = "openvino_thinker_merger_model.xml"
-THINKER_EMBEDDING_NAME = "openvino_thinker_embedding_model.xml"
+# input:
+# name="attention_mask" shape="?,?" element_type="i64"
+# name="position_ids" shape="3,?,?" element_type="i64"
+# name="inputs_embeds" shape="?,?,3584" element_type="f32"
+# name="beam_idx" shape="?,?,3584" element_type="f32"
+# output:
+# shape="?,?,152064" element_type="f32"
+# shape="?,?,3584" element_type="f32"
 
+THINKER_AUDIO_NAME = "openvino_thinker_audio_model.xml"
+# input:
+# name="padded_feature" shape="?,128,?" element_type="f32"
+# name="padded_mask" shape="?,?,?" element_type="i32"
+# name="padded_mask_after_cnn" shape="?,?" element_type="boolean"
+# output:
+# shape="?,1280" element_type="f32"
+THINKER_AUDIO_STATE_NAME = "openvino_thinker_audio_state_model.xml"
+# input:
+# name="each_audio_states" shape="?,?" element_type="f32"
+# output:
+# shape="?,3584" element_type="f32"
+
+THINKER_PATCHER_NAME = "openvino_thinker_patcher_model.xml"
+# input:
+# name="hidden_states" shape="?,?" element_type="f32"
+# output:
+# shape="?,1280" element_type="f32"
+THINKER_MERGER_NAME = "openvino_thinker_merger_model.xml"
+# input:
+# name="hidden_states" shape="?,?" element_type="f32"
+# name="attention_mask" shape="?,?,?" element_type="f32"
+# name="window_attention_mask" shape="?,?,?" element_type="f32"
+# name="window_index" shape="?" element_type="i32"
+# name="rotary_pos_emb" shape="?,?" element_type="f32"
+# output:
+# shape="?,3584" element_type="f32"
+
+THINKER_EMBEDDING_NAME = "openvino_thinker_embedding_model.xml"
+# input:
+# name="input" shape="?,?" element_type="i64"
+# output:
+# shape="?,?,3584" element_type="f32"
 
 TALKER_LANGUAGE_NAME = "openvino_talker_language_model.xml"
+# input:
+# name="attention_mask" shape="?,?" element_type="i64"
+# name="position_ids" shape="3,?,?" element_type="i64"
+# name="inputs_embeds" shape="?,?,3584" element_type="f32"
+# name="beam_idx" shape="?" element_type="i32"
+# output:
+# shape="?,?,8448" element_type="f32"
 TALKER_EMBEDDING_NAME = "openvino_talker_embedding_model.xml"
+# input:
+# name="input" shape="?,?" element_type="i64"
+# output:
+# shape="?,?,3584" element_type="f32"
 
 TOKEN2WAV_DIT_NAME = "openvino_token2wav_dit_model.xml"
 TOKEN2WAV_BIGVGAN_NAME = "openvino_token2wav_bigvgan_model.xml"
@@ -1181,7 +1228,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         return window_index, cu_window_seqlens
 
     def visual(self, pixel_values, grid_thw, **kwargs):
-        hidden_states = self.visual_patcher(pixel_values)[0]
+        hidden_states = self.visual_patcher(pixel_values)[0] # model mark 4
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
         window_index, cu_window_seqlens = self.get_window_index(grid_thw)
         cu_window_seqlens = torch.tensor(
@@ -1205,7 +1252,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
 
         window_causal_mask.masked_fill_(torch.logical_not(window_attention_mask), float("-inf"))
 
-        res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0]
+        res = self.visual_merger([hidden_states, causal_mask, window_causal_mask, window_index, rotary_pos_emb])[0] # model mark
         return torch.from_numpy(res)
 
     def __call__(
@@ -1323,7 +1370,12 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         if inputs_embeds is None:
             # 1. Extract the input embeddings
-            inputs_embeds = torch.from_numpy(self.embed_tokens(input_ids)[0])
+            print("inputs_embeds is None")
+            inputs_embeds = torch.from_numpy(self.embed_tokens(input_ids)[0]) # model mark 1
+            print("Shape of input_ids:", input_ids.shape)
+            print("Type of input_ids:", input_ids.dtype)
+            print("Shape of inputs_embeds:", inputs_embeds.shape)
+            print("Type of inputs_embeds:", inputs_embeds.dtype)
         if input_ids is not None and input_ids.shape[1] != 1:  # Prefill stage
             if input_features is not None:
                 audio_feat_lengths, audio_output_lengths = self._get_feat_extract_output_lengths(
@@ -1346,11 +1398,11 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 padded_feature, padded_mask, padded_mask_after_cnn = self.padded_and_mask_function(
                     chunk_list, chunk_lengths, padding_value=0, padding_side="right"
                 )
-                hidden_states = torch.from_numpy(self.audio([padded_feature, padded_mask, padded_mask_after_cnn])[0])
+                hidden_states = torch.from_numpy(self.audio([padded_feature, padded_mask, padded_mask_after_cnn])[0]) # model mark 2
                 hidden_states_list = hidden_states.split(audio_feat_lengths.tolist(), dim=0)
                 token_audio_list = []
                 for each_audio_states in hidden_states_list:
-                    each_audio_states = torch.from_numpy(self.audio_state([each_audio_states])[0])
+                    each_audio_states = torch.from_numpy(self.audio_state([each_audio_states])[0]) # model mark 3
                     token_audio_list.append(each_audio_states)
                 audio_features = torch.cat(token_audio_list, dim=0)
 
@@ -1361,13 +1413,13 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
             if pixel_values is not None:
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw) # model mark 
                 image_mask = (input_ids == self.config.image_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw) # model mark
                 video_mask = (input_ids == self.config.video_token_index).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
@@ -1385,7 +1437,7 @@ class OVQwen2_5OmniThinkerForConditionalGeneration(GenerationMixin):
         inputs["position_ids"] = position_ids
         if "beam_idx" in self.input_names:
             inputs["beam_idx"] = self.next_beam_idx if self.next_beam_idx is not None else np.arange(inputs_embeds.shape[0], dtype=int)
-        self.request.start_async(inputs, share_inputs=True)
+        self.request.start_async(inputs, share_inputs=True) # model mark
         self.request.wait()
         logits = self.request.get_tensor("logits").data
         hidden_states = self.request.get_tensor("hidden_states").data
